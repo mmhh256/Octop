@@ -277,6 +277,80 @@ def test_put_and_expand_custom_mcp(svc: ConnectorService, db: SqlitePool):
     assert set(svc.list_active_mcp_server_names(uid)) == {"deepwiki", "local"}
 
 
+def test_legacy_text_credentials_preserve_listing_and_agent_configs(
+    svc: ConnectorService,
+    db: SqlitePool,
+) -> None:
+    """One legacy TEXT token must not break unrelated connectors or MCP assembly."""
+    uid = _ensure_user(db)
+    repo = ConnectorRepo(db)
+    builtin_id = new_ulid()
+    builtin_name = mcp_server_name("tencent-docs", builtin_id)
+    repo.create(
+        instance_id=builtin_id,
+        user_id=uid,
+        kind="tencent-docs",
+        display_name="Healthy documents",
+        mcp_server_name=builtin_name,
+    )
+    svc.encrypt_and_store(instance_id=builtin_id, payload={"token": "test-token"})
+    servers = svc.put_custom_servers(
+        uid,
+        {
+            "legacy": {
+                "transport": "streamable_http",
+                "url": "https://mcp.example.com/mcp",
+                "headers": {"Authorization": "Bearer legacy-token"},
+            },
+        },
+    )
+    parent = repo.get_by_user_kind(uid, CUSTOM_MCP_KIND)
+    assert parent is not None
+    original_blob = parent.credential_blob
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE connectors SET credential_blob = CAST(credential_blob AS TEXT) "
+            "WHERE instance_id = ?",
+            (parent.instance_id,),
+        )
+        stored = conn.execute(
+            "SELECT typeof(credential_blob) AS storage_type FROM connectors WHERE instance_id = ?",
+            (parent.instance_id,),
+        ).fetchone()
+    assert stored["storage_type"] == "text"
+
+    visible = {row.instance_id: row for row in repo.list_visible(uid)}
+    assert set(visible) == {builtin_id, parent.instance_id}
+    assert visible[parent.instance_id].credential_blob == original_blob
+    assert extract_servers(svc.decrypt(parent.instance_id)) == servers
+    listed = svc.list_instances_for_api(uid)
+    assert {row["mcp_server_name"] for row in listed} == {builtin_name, "legacy"}
+    assert all(row["has_credentials"] for row in listed)
+    assert svc.custom_harness_configs(uid)["legacy"]["headers"]["Authorization"] == (
+        "Bearer legacy-token"
+    )
+    configs = build_mcp_server_configs_for_user(
+        svc=svc,
+        connector_repo=repo,
+        user_id=uid,
+        agent_id="test-agent",
+        agent_user_id=uid,
+        config=OctopConfig(),
+    )
+    assert configs[builtin_name]["headers"]["Authorization"] == "test-token"
+    assert "legacy" in configs
+
+    # The compatibility read must not change storage; a normal save restores BLOB.
+    svc.put_custom_servers(uid, servers)
+    with db.connect() as conn:
+        stored = conn.execute(
+            "SELECT typeof(credential_blob) AS storage_type FROM connectors WHERE instance_id = ?",
+            (parent.instance_id,),
+        ).fetchone()
+    assert stored["storage_type"] == "blob"
+    assert extract_servers(svc.decrypt(parent.instance_id)) == servers
+
+
 def test_put_empty_servers_deletes_parent_row(svc: ConnectorService, db: SqlitePool):
     uid = _ensure_user(db)
     svc.put_custom_servers(

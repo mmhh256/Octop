@@ -225,6 +225,47 @@ async def test_connector_names_are_unique_across_builtin_and_custom(env):
     assert builtin.json()["error"]["code"] == "CONNECTOR_NAME_TAKEN"
 
 
+async def test_list_instances_with_legacy_text_custom_credentials(env):
+    c, srv, auth, _ = env
+    builtin = await c.post(
+        "/api/connector-instances",
+        headers=auth,
+        json={
+            "kind": "tencent-docs",
+            "display_name": "Healthy documents",
+            "credentials": {"token": "test-token"},
+        },
+    )
+    assert builtin.status_code == 201
+    custom = await c.put(
+        "/api/connectors/custom-mcp",
+        headers=auth,
+        json={
+            "servers": {
+                "legacy": {
+                    "transport": "streamable_http",
+                    "url": "https://mcp.example.com/mcp",
+                    "headers": {"Authorization": "Bearer legacy-token"},
+                },
+            },
+        },
+    )
+    assert custom.status_code == 200
+    with srv.services.db.transaction() as conn:
+        conn.execute(
+            "UPDATE connectors SET credential_blob = CAST(credential_blob AS TEXT) WHERE kind = ?",
+            (CUSTOM_MCP_KIND,),
+        )
+
+    listed = await c.get("/api/connector-instances", headers=auth)
+    assert listed.status_code == 200
+    by_name = {item["mcp_server_name"]: item for item in listed.json()}
+    assert set(by_name) == {builtin.json()["mcp_server_name"], "legacy"}
+    assert all(item["has_credentials"] for item in by_name.values())
+    assert by_name["legacy"]["status"] == "active"
+    assert "legacy-token" not in listed.text
+
+
 async def test_custom_name_cannot_duplicate_builtin_connector(env):
     c, _, auth, _ = env
     builtin = await c.post(

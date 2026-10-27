@@ -30,6 +30,11 @@ class ConnectorRow:
     @classmethod
     def from_row(cls, r: DbRow) -> ConnectorRow:
         blob = r["credential_blob"]
+        # Older custom-MCP writes stored the encrypted token as SQLite TEXT.
+        # Recover its bytes before mapping the row; one legacy row otherwise
+        # prevents every visible connector from loading.
+        if isinstance(blob, str):
+            blob = blob.encode("utf-8")
         return cls(
             id=r["id"],
             instance_id=r["instance_id"],
